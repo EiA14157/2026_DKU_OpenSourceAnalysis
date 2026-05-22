@@ -36,6 +36,7 @@ LSMDB::LSMDB(const MemDBOptions& options)
 void LSMDB::Put(int key, const std::string& value) {
   const size_t entry_bytes = EntryBytes(key, value);
   EnsureMutableCapacity(entry_bytes);
+  // Sequence numbers keep out-of-place updates globally ordered.
   mutable_->list.PutWithSequence(key, value, next_seq_++);
   mutable_->size_bytes += entry_bytes;
 }
@@ -43,6 +44,8 @@ void LSMDB::Put(int key, const std::string& value) {
 bool LSMDB::Get(int key, std::string* out_value) const {
   std::string value;
   bool tombstone = false;
+  // Search order: mutable memtable -> immutable memtables -> newest SSTables.
+  // The first matching entry is the newest visible version of the key.
   if (mutable_->list.GetLatest(key, &value, &tombstone)) {
     if (tombstone) {
       return false;
@@ -82,6 +85,7 @@ bool LSMDB::Get(int key, std::string* out_value) const {
 void LSMDB::Delete(int key) {
   const size_t entry_bytes = EntryBytes(key, "");
   EnsureMutableCapacity(entry_bytes);
+  // Delete is stored as a tombstone instead of removing older versions in place.
   mutable_->list.DeleteWithSequence(key, next_seq_++);
   mutable_->size_bytes += entry_bytes;
 }
@@ -94,6 +98,8 @@ std::vector<std::pair<int, std::string>> LSMDB::RangeScan(int start_key,
   }
 
   std::map<int, std::pair<bool, std::string>> latest;
+  // Merge every level from newest to oldest and keep only the first version
+  // seen for each user key.
   auto merge_skiplist = [&](const std::vector<SkipList::RangeEntry>& entries) {
     for (const auto& entry : entries) {
       if (latest.find(entry.key) != latest.end()) {
@@ -139,6 +145,7 @@ void LSMDB::EnsureMutableCapacity(size_t entry_bytes) {
     return;
   }
 
+  // Once the mutable memtable is full, freeze it and flush it to disk.
   mutable_->immutable = true;
   immutables_.push_back(std::move(mutable_));
   mutable_ = std::make_unique<MemTable>(options_);
@@ -159,6 +166,7 @@ void LSMDB::FlushAllImmutables() {
 void LSMDB::FlushOneImmutable(const MemTable* table) {
   const uint64_t file_id = next_file_id_++;
   std::vector<SSTableEntry> flush_entries;
+  // Flush only the newest version of each key from this memtable.
   auto entries = table->list.RangeScanLatest(std::numeric_limits<int>::min(),
                                              std::numeric_limits<int>::max());
   flush_entries.reserve(entries.size());
@@ -180,6 +188,8 @@ void LSMDB::MaybeCompactSSTables() {
     return;
   }
 
+  // This lab compacts the full SSTable set whenever the file count crosses the
+  // configured threshold.
   const uint64_t file_id = next_file_id_++;
   auto compacted_file = CompactAllSSTables(
       options_.sst_dir, flushed_files_, file_id,

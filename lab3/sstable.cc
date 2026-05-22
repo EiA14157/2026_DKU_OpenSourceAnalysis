@@ -34,6 +34,7 @@ bool ReadSSTableHeader(std::ifstream* in, SSTableHeader* header) {
     return false;
   }
 
+  // The first line always stores the key/sequence-number range metadata.
   std::istringstream meta(line);
   std::string tag;
   int bloom_enabled = 0;
@@ -55,6 +56,7 @@ bool ReadSSTableHeader(std::ifstream* in, SSTableHeader* header) {
     return false;
   }
 
+  // When bloom filter is enabled, the second line stores its shape and bits.
   std::istringstream bloom(line);
   std::string bloom_tag;
   std::string encoded_bits;
@@ -79,6 +81,7 @@ bool ParseSSTableDataLine(const std::string& line, SSTableEntry* entry) {
   }
 
   if (op == "P") {
+    // Put entries keep key, sequence number, and value.
     if (!(iss >> entry->key >> entry->seq >> entry->value)) {
       return false;
     }
@@ -87,6 +90,7 @@ bool ParseSSTableDataLine(const std::string& line, SSTableEntry* entry) {
   }
 
   if (op == "D") {
+    // Delete entries keep only key and sequence number.
     if (!(iss >> entry->key >> entry->seq)) {
       return false;
     }
@@ -168,6 +172,7 @@ std::vector<SSTableFile> ListSSTables(const std::string& sst_dir,
       continue;
     }
 
+    // Only files that match sst_<id>.txt are part of the database state.
     auto file_id = ParseSSTFileId(entry.path().filename().string());
     if (!file_id.has_value()) {
       continue;
@@ -228,6 +233,10 @@ SSTableFile WriteSSTable(const std::string& sst_dir, uint64_t file_id,
   SSTableHeader header =
       BuildHeaderFromEntries(entries, write_bloom_filter, std::move(bloom_filter));
 
+  // SSTable format is text-based:
+  // META ...
+  // BLOOM ...   (optional)
+  // P/D ...     (one line per newest visible key in the flushed memtable)
   std::ofstream out(file.path, std::ios::trunc);
   if (!out.is_open()) {
     throw std::runtime_error("failed to create SSTable: " + file.path);
@@ -264,6 +273,7 @@ bool GetFromSSTable(const SSTableFile& file, int key, std::string* value,
   if (key < file.smallest_key || key > file.largest_key) {
     return false;
   }
+  // Bloom filter can reject definitely-missing keys before disk scan.
   if (file.has_bloom_filter && !file.bloom_filter.Empty() &&
       !file.bloom_filter.MayContain(key)) {
     return false;
@@ -285,6 +295,7 @@ bool GetFromSSTable(const SSTableFile& file, int key, std::string* value,
     if (!ParseSSTableDataLine(line, &entry)) {
       continue;
     }
+    // Entries are sorted by key, so search can stop once we pass the target.
     if (entry.key == key) {
       if (value != nullptr) {
         *value = entry.value;
@@ -325,6 +336,8 @@ std::vector<SSTableEntry> RangeScanSSTable(const SSTableFile& file,
     if (!ParseSSTableDataLine(line, &entry)) {
       continue;
     }
+    // Because SSTable data is ordered by key, range scan can skip the prefix
+    // and stop as soon as the upper bound is exceeded.
     if (entry.key < start_key) {
       continue;
     }

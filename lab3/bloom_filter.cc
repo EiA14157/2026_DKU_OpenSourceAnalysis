@@ -59,6 +59,7 @@ size_t BloomByteSize(size_t bit_count) { return (bit_count + 7) / 8; }
 std::string EncodeBloomFilterBits(const std::vector<uint8_t>& bytes) {
   std::string out;
   out.reserve(bytes.size() * 2);
+  // Store the bit array in a text SSTable by converting each byte to hex.
   for (uint8_t byte : bytes) {
     out.push_back(NibbleToHex(static_cast<uint8_t>(byte >> 4)));
     out.push_back(NibbleToHex(static_cast<uint8_t>(byte & 0x0F)));
@@ -74,6 +75,7 @@ bool DecodeBloomFilterBits(const std::string& encoded,
 
   out->clear();
   out->reserve(encoded.size() / 2);
+  // Restore the original bloom-filter bytes from the hex string in SSTable.
   for (size_t i = 0; i < encoded.size(); i += 2) {
     uint8_t hi = 0;
     uint8_t lo = 0;
@@ -97,6 +99,7 @@ BloomFilter BuildBloomFilterFromKeys(const std::vector<int>& keys,
   filter.bit_count = std::max<size_t>(8, keys.size() * bits_per_key);
   filter.hash_count = hash_count;
   filter.bits.assign(BloomByteSize(filter.bit_count), 0);
+  // Insert every key once so the finished filter can be written into SSTable.
   for (int key : keys) {
     filter.Add(key);
   }
@@ -108,6 +111,7 @@ void BloomFilter::Add(int key) {
     return;
   }
 
+  // One logical key is mapped through multiple seeded hashes.
   for (size_t i = 0; i < hash_count; ++i) {
     SetBit(&bits, PositiveModulo(SimpleHash(key, i), bit_count));
   }
@@ -118,6 +122,7 @@ bool BloomFilter::MayContain(int key) const {
     return true;
   }
 
+  // A key can exist only if every hash position is already set.
   for (size_t i = 0; i < hash_count; ++i) {
     if (!GetBit(bits, PositiveModulo(SimpleHash(key, i), bit_count))) {
       return false;

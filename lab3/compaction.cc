@@ -22,6 +22,8 @@ CompactAllSSTables(const std::string& sst_dir,
     return std::nullopt;
   }
 
+  // Read SSTables from newest to oldest so the first entry seen for a key is
+  // the version that should survive compaction.
   std::map<int, SSTableEntry> latest;
   for (auto it = files.rbegin(); it != files.rend(); ++it) {
     auto entries = RangeScanSSTable(*it, std::numeric_limits<int>::min(),
@@ -37,6 +39,7 @@ CompactAllSSTables(const std::string& sst_dir,
   std::vector<SSTableEntry> compacted_entries;
   compacted_entries.reserve(latest.size());
   for (const auto& kv : latest) {
+    // Final tombstones are dropped because compaction sees the full file set.
     if (!kv.second.tombstone) {
       compacted_entries.push_back(kv.second);
     }
@@ -49,6 +52,7 @@ CompactAllSSTables(const std::string& sst_dir,
                                   bloom_hash_count);
   }
 
+  // Replace all old SSTables only after the new compacted file is ready.
   for (const auto& file : files) {
     RemoveSSTableFile(file);
   }
