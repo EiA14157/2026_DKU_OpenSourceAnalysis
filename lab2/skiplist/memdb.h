@@ -1,9 +1,9 @@
 #ifndef LAB2_MEMDB_H
 #define LAB2_MEMDB_H
 
-#include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "skiplist.h"
@@ -21,7 +21,8 @@ class InMemoryDB {
   void Put(int key, const std::string& value);
   bool Get(int key, std::string* out_value) const;
   void Delete(int key);
-  std::vector<std::pair<int, std::string>> RangeScan(int start_key, int end_key) const;
+  std::vector<std::pair<int, std::string>> RangeScan(int start_key,
+                                                     int end_key) const;
 
   size_t ImmutableCount() const;
   size_t MutableSizeBytes() const;

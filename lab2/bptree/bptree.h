@@ -1,15 +1,13 @@
 #ifndef LAB2_BPTREE_H
 #define LAB2_BPTREE_H
 
-#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
 
 // 필요시 내부 function, 변수 등 선언 가능
-
 class BPlusTree {
-public:
+ public:
   explicit BPlusTree(int degree = 4);
   ~BPlusTree();
 
@@ -22,13 +20,35 @@ public:
   std::vector<std::pair<int, std::string>> RangeScan(int start_key,
                                                      int end_key) const;
 
-private:
+ private:
   struct Node;
+  struct Node {
+    bool is_leaf;
+    std::vector<int> keys;
+    std::vector<Node*> children;
+    std::vector<std::string> values;
+    Node* parent;
+    Node* next;
 
-  struct Node {};
+    explicit Node(bool leaf)
+        : is_leaf(leaf), parent(nullptr), next(nullptr) {}
+  };
+
+  void Destroy(Node* node);
+  Node* FindLeaf(int key) const;
+  int FindChildIndex(const Node* parent, const Node* child) const;
+  int FirstKey(const Node* node) const;
+  void RefreshKeys(Node* node);
+  void RefreshKeysUpward(Node* node);
+
+  void SplitLeaf(Node* leaf);
+  void SplitInternal(Node* node);
+
+  void RebalanceLeaf(Node* leaf);
+  void RebalanceInternal(Node* node);
 
   Node* root_;
   int degree_;
 };
 
-#endif // LAB2_BPTREE_H
+#endif  // LAB2_BPTREE_H
