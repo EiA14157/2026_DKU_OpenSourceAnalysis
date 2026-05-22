@@ -29,10 +29,45 @@ BloomFilter BuildBloomFilter(const std::vector<SSTableEntry>& entries,
 }
 
 bool ReadSSTableHeader(std::ifstream* in, SSTableHeader* header) {
-  
-  // SSTable header를 읽는 함수.
-  // Bloom filter bonus 진행시 bloom bits를 읽는 작업도 진행
+  std::string line;
+  if (!std::getline(*in, line)) {
+    return false;
+  }
 
+  std::istringstream meta(line);
+  std::string tag;
+  int bloom_enabled = 0;
+  if (!(meta >> tag >> bloom_enabled >> header->smallest_key >>
+        header->largest_key >> header->oldest_seq >> header->newest_seq)) {
+    return false;
+  }
+  if (tag != "META") {
+    return false;
+  }
+
+  header->has_metadata = true;
+  header->has_bloom_filter = (bloom_enabled != 0);
+  if (!header->has_bloom_filter) {
+    return true;
+  }
+
+  if (!std::getline(*in, line)) {
+    return false;
+  }
+
+  std::istringstream bloom(line);
+  std::string bloom_tag;
+  std::string encoded_bits;
+  if (!(bloom >> bloom_tag >> header->bloom_filter.bit_count >>
+        header->bloom_filter.hash_count >> encoded_bits)) {
+    return false;
+  }
+  if (bloom_tag != "BLOOM") {
+    return false;
+  }
+  if (!DecodeBloomFilterBits(encoded_bits, &header->bloom_filter.bits)) {
+    return false;
+  }
   return true;
 }
 
@@ -44,18 +79,26 @@ bool ParseSSTableDataLine(const std::string& line, SSTableEntry* entry) {
   }
 
   if (op == "P") {
-    // Put operation
+    if (!(iss >> entry->key >> entry->seq >> entry->value)) {
+      return false;
+    }
+    entry->tombstone = false;
+    return true;
   }
 
   if (op == "D") {
-    // Delete operation
+    if (!(iss >> entry->key >> entry->seq)) {
+      return false;
+    }
+    entry->value.clear();
+    entry->tombstone = true;
+    return true;
   }
 
   return false;
 }
 
 std::optional<uint64_t> ParseSSTFileId(const std::string& name) {
-  // SSTable 이름 parsing
   const std::string prefix = "sst_";
   const std::string suffix = ".txt";
   if (name.size() <= prefix.size() + suffix.size()) {
@@ -83,7 +126,6 @@ std::optional<uint64_t> ParseSSTFileId(const std::string& name) {
 SSTableHeader BuildHeaderFromEntries(const std::vector<SSTableEntry>& entries,
                                      bool has_bloom_filter,
                                      BloomFilter bloom_filter) {
-  // entry를 기반으로 SSTable header를 작성하는 함수. 필요시 사용
   SSTableHeader header;
   header.has_bloom_filter = has_bloom_filter;
   header.bloom_filter = std::move(bloom_filter);
@@ -106,8 +148,6 @@ SSTableHeader BuildHeaderFromEntries(const std::vector<SSTableEntry>& entries,
 }
 }  // namespace
 
-// *****
-
 void EnsureSSTDir(const std::string& sst_dir) {
   std::filesystem::create_directories(sst_dir);
 }
@@ -118,15 +158,54 @@ bool IsSSTDirEmpty(const std::string& sst_dir) {
          std::filesystem::directory_iterator();
 }
 
-// ***** Directory open시 사용하는 함수.
-
 std::vector<SSTableFile> ListSSTables(const std::string& sst_dir,
-                                     bool load_bloom_filter) {
+                                      bool load_bloom_filter) {
   EnsureSSTDir(sst_dir);
   std::vector<SSTableFile> out;
 
-  // sst_dir의 SSTable을 읽고 SSTableFile struct vector에 등록하는 함수
+  for (const auto& entry : std::filesystem::directory_iterator(sst_dir)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
 
+    auto file_id = ParseSSTFileId(entry.path().filename().string());
+    if (!file_id.has_value()) {
+      continue;
+    }
+
+    SSTableFile file;
+    file.id = *file_id;
+    file.path = entry.path().string();
+
+    std::ifstream in(file.path);
+    if (!in.is_open()) {
+      throw std::runtime_error("failed to open SSTable: " + file.path);
+    }
+
+    SSTableHeader header;
+    if (!ReadSSTableHeader(&in, &header) || !header.has_metadata) {
+      throw std::runtime_error("failed to read SSTable header: " + file.path);
+    }
+
+    file.smallest_key = header.smallest_key;
+    file.largest_key = header.largest_key;
+    file.oldest_seq = header.oldest_seq;
+    file.newest_seq = header.newest_seq;
+    file.has_bloom_filter = header.has_bloom_filter;
+    if (load_bloom_filter && header.has_bloom_filter) {
+      file.bloom_filter = std::move(header.bloom_filter);
+    } else if (header.has_bloom_filter) {
+      file.bloom_filter.bit_count = header.bloom_filter.bit_count;
+      file.bloom_filter.hash_count = header.bloom_filter.hash_count;
+    }
+
+    out.push_back(std::move(file));
+  }
+
+  std::sort(out.begin(), out.end(),
+            [](const SSTableFile& a, const SSTableFile& b) {
+              return a.id < b.id;
+            });
   return out;
 }
 
@@ -134,28 +213,126 @@ SSTableFile WriteSSTable(const std::string& sst_dir, uint64_t file_id,
                          const std::vector<SSTableEntry>& entries,
                          bool write_bloom_filter, size_t bloom_bits_per_key,
                          size_t bloom_hash_count) {
+  EnsureSSTDir(sst_dir);
+
   SSTableFile file;
+  file.id = file_id;
+  file.path =
+      (std::filesystem::path(sst_dir) / ("sst_" + std::to_string(file_id) + ".txt"))
+          .string();
 
-  // 주어진 entries에서 SSTable을 작성하는 함수
+  BloomFilter bloom_filter;
+  if (write_bloom_filter) {
+    bloom_filter = BuildBloomFilter(entries, bloom_bits_per_key, bloom_hash_count);
+  }
+  SSTableHeader header =
+      BuildHeaderFromEntries(entries, write_bloom_filter, std::move(bloom_filter));
 
+  std::ofstream out(file.path, std::ios::trunc);
+  if (!out.is_open()) {
+    throw std::runtime_error("failed to create SSTable: " + file.path);
+  }
+
+  out << "META " << (header.has_bloom_filter ? 1 : 0) << " "
+      << header.smallest_key << " " << header.largest_key << " "
+      << header.oldest_seq << " " << header.newest_seq << "\n";
+  if (header.has_bloom_filter) {
+    out << "BLOOM " << header.bloom_filter.bit_count << " "
+        << header.bloom_filter.hash_count << " "
+        << EncodeBloomFilterBits(header.bloom_filter.bits) << "\n";
+  }
+  for (const auto& entry : entries) {
+    if (entry.tombstone) {
+      out << "D " << entry.key << " " << entry.seq << "\n";
+    } else {
+      out << "P " << entry.key << " " << entry.seq << " " << entry.value << "\n";
+    }
+  }
+  out.close();
+
+  file.smallest_key = header.smallest_key;
+  file.largest_key = header.largest_key;
+  file.oldest_seq = header.oldest_seq;
+  file.newest_seq = header.newest_seq;
+  file.has_bloom_filter = header.has_bloom_filter;
+  file.bloom_filter = std::move(header.bloom_filter);
   return file;
 }
 
 bool GetFromSSTable(const SSTableFile& file, int key, std::string* value,
                     bool* tombstone) {
+  if (key < file.smallest_key || key > file.largest_key) {
+    return false;
+  }
+  if (file.has_bloom_filter && !file.bloom_filter.Empty() &&
+      !file.bloom_filter.MayContain(key)) {
+    return false;
+  }
 
-  // SSTable에서 key를 읽는 함수
-  // Bloom filter 존재시 먼저 읽고 탐색을 진행해야 함
+  std::ifstream in(file.path);
+  if (!in.is_open()) {
+    throw std::runtime_error("failed to open SSTable: " + file.path);
+  }
 
+  SSTableHeader header;
+  if (!ReadSSTableHeader(&in, &header)) {
+    throw std::runtime_error("failed to read SSTable header: " + file.path);
+  }
+
+  std::string line;
+  while (std::getline(in, line)) {
+    SSTableEntry entry;
+    if (!ParseSSTableDataLine(line, &entry)) {
+      continue;
+    }
+    if (entry.key == key) {
+      if (value != nullptr) {
+        *value = entry.value;
+      }
+      if (tombstone != nullptr) {
+        *tombstone = entry.tombstone;
+      }
+      return true;
+    }
+    if (entry.key > key) {
+      return false;
+    }
+  }
   return false;
 }
 
 std::vector<SSTableEntry> RangeScanSSTable(const SSTableFile& file,
                                            int start_key, int end_key) {
-  
-  // SSTable에서 Range scan을 진행하는 함수
-
   std::vector<SSTableEntry> out;
+  if (start_key > end_key || end_key < file.smallest_key ||
+      start_key > file.largest_key) {
+    return out;
+  }
+
+  std::ifstream in(file.path);
+  if (!in.is_open()) {
+    throw std::runtime_error("failed to open SSTable: " + file.path);
+  }
+
+  SSTableHeader header;
+  if (!ReadSSTableHeader(&in, &header)) {
+    throw std::runtime_error("failed to read SSTable header: " + file.path);
+  }
+
+  std::string line;
+  while (std::getline(in, line)) {
+    SSTableEntry entry;
+    if (!ParseSSTableDataLine(line, &entry)) {
+      continue;
+    }
+    if (entry.key < start_key) {
+      continue;
+    }
+    if (entry.key > end_key) {
+      break;
+    }
+    out.push_back(std::move(entry));
+  }
 
   return out;
 }

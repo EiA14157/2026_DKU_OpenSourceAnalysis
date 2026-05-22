@@ -6,7 +6,6 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
-#include <unordered_set>
 #include <utility>
 
 LSMDB::MemTable::MemTable(const MemDBOptions& options)
@@ -32,29 +31,97 @@ LSMDB::LSMDB(const MemDBOptions& options)
     throw std::runtime_error(
         "sst_dir is not empty; set use_existing_db=true to reuse it");
   }
-} // DB Open 구현 기본 제공
+}
 
 void LSMDB::Put(int key, const std::string& value) {
-  // DB에 제공되는 key-value 삽입
-  // Memtable이 가득 차면 immutable로 바꾸고 Flush 진행
+  const size_t entry_bytes = EntryBytes(key, value);
+  EnsureMutableCapacity(entry_bytes);
+  mutable_->list.PutWithSequence(key, value, next_seq_++);
+  mutable_->size_bytes += entry_bytes;
 }
 
 bool LSMDB::Get(int key, std::string* out_value) const {
-  // DB내에 해당하는 key를 찾기
-  return true;
+  std::string value;
+  bool tombstone = false;
+  if (mutable_->list.GetLatest(key, &value, &tombstone)) {
+    if (tombstone) {
+      return false;
+    }
+    if (out_value != nullptr) {
+      *out_value = value;
+    }
+    return true;
+  }
+
+  for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
+    if ((*it)->list.GetLatest(key, &value, &tombstone)) {
+      if (tombstone) {
+        return false;
+      }
+      if (out_value != nullptr) {
+        *out_value = value;
+      }
+      return true;
+    }
+  }
+
+  for (auto it = flushed_files_.rbegin(); it != flushed_files_.rend(); ++it) {
+    if (GetFromSSTable(*it, key, &value, &tombstone)) {
+      if (tombstone) {
+        return false;
+      }
+      if (out_value != nullptr) {
+        *out_value = value;
+      }
+      return true;
+    }
+  }
+  return false;
 }
 
 void LSMDB::Delete(int key) {
-  // DB내에 해당하는 key에 대해 tombstone(deletion marker) 삽입
-  // Memtable이 가득 차면 immutable로 바꾸고 Flush 진행
+  const size_t entry_bytes = EntryBytes(key, "");
+  EnsureMutableCapacity(entry_bytes);
+  mutable_->list.DeleteWithSequence(key, next_seq_++);
+  mutable_->size_bytes += entry_bytes;
 }
 
 std::vector<std::pair<int, std::string>> LSMDB::RangeScan(int start_key,
                                                           int end_key) const {
-
-  // DB내에 key 범위에 해당하는 key-value 쌍을 모두 찾아서 반환
-
   std::vector<std::pair<int, std::string>> out;
+  if (start_key > end_key) {
+    return out;
+  }
+
+  std::map<int, std::pair<bool, std::string>> latest;
+  auto merge_skiplist = [&](const std::vector<SkipList::RangeEntry>& entries) {
+    for (const auto& entry : entries) {
+      if (latest.find(entry.key) != latest.end()) {
+        continue;
+      }
+      latest[entry.key] = {!entry.tombstone, entry.value};
+    }
+  };
+
+  merge_skiplist(mutable_->list.RangeScanLatest(start_key, end_key));
+  for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
+    merge_skiplist((*it)->list.RangeScanLatest(start_key, end_key));
+  }
+  for (auto it = flushed_files_.rbegin(); it != flushed_files_.rend(); ++it) {
+    auto entries = RangeScanSSTable(*it, start_key, end_key);
+    for (const auto& entry : entries) {
+      if (latest.find(entry.key) != latest.end()) {
+        continue;
+      }
+      latest[entry.key] = {!entry.tombstone, entry.value};
+    }
+  }
+
+  for (const auto& kv : latest) {
+    if (kv.second.first) {
+      out.emplace_back(kv.first, kv.second.second);
+    }
+  }
   return out;
 }
 
@@ -65,7 +132,9 @@ size_t LSMDB::FlushedFileCount() const { return flushed_files_.size(); }
 size_t LSMDB::MutableSizeBytes() const { return mutable_->size_bytes; }
 
 void LSMDB::EnsureMutableCapacity(size_t entry_bytes) {
-  // Mutable Memtable의 사이즈를 체크하는 함수. 필요시 사용
+  if (mutable_->size_bytes == 0) {
+    return;
+  }
   if (mutable_->size_bytes + entry_bytes <= options_.max_memtable_bytes) {
     return;
   }
@@ -73,13 +142,10 @@ void LSMDB::EnsureMutableCapacity(size_t entry_bytes) {
   mutable_->immutable = true;
   immutables_.push_back(std::move(mutable_));
   mutable_ = std::make_unique<MemTable>(options_);
-
-  // Flush as soon as immutable memtable exists.
   FlushAllImmutables();
 }
 
 size_t LSMDB::EntryBytes(int key, const std::string& value) const {
-  // 각 entry의 크기 byte를 반환하는 함수. 필요시 사용
   return sizeof(key) + value.size();
 }
 
@@ -91,7 +157,6 @@ void LSMDB::FlushAllImmutables() {
 }
 
 void LSMDB::FlushOneImmutable(const MemTable* table) {
-  // 하나의 Immutable Memtable을 SSTable로 flush하는 함수. 필요시 사용.
   const uint64_t file_id = next_file_id_++;
   std::vector<SSTableEntry> flush_entries;
   auto entries = table->list.RangeScanLatest(std::numeric_limits<int>::min(),
@@ -110,7 +175,6 @@ void LSMDB::FlushOneImmutable(const MemTable* table) {
 }
 
 void LSMDB::MaybeCompactSSTables() {
-  // SSTable 개수를 검사해 Compaction을 진행하는 함수. 필요시 사용.
   if (!options_.enable_compaction || options_.compaction_file_threshold == 0 ||
       flushed_files_.size() <= options_.compaction_file_threshold) {
     return;

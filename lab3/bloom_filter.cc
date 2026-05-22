@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace { // Bloom filter 제작에 필요한 함수들
-size_t PositiveModulo(uint64_t value, size_t mod) { 
+namespace {
+size_t PositiveModulo(uint64_t value, size_t mod) {
   return static_cast<size_t>(value % static_cast<uint64_t>(mod));
 }
 
@@ -58,9 +58,11 @@ size_t BloomByteSize(size_t bit_count) { return (bit_count + 7) / 8; }
 
 std::string EncodeBloomFilterBits(const std::vector<uint8_t>& bytes) {
   std::string out;
-
-  // bloom filter bytes를 string으로 encoding하는 함수
-
+  out.reserve(bytes.size() * 2);
+  for (uint8_t byte : bytes) {
+    out.push_back(NibbleToHex(static_cast<uint8_t>(byte >> 4)));
+    out.push_back(NibbleToHex(static_cast<uint8_t>(byte & 0x0F)));
+  }
   return out;
 }
 
@@ -70,8 +72,17 @@ bool DecodeBloomFilterBits(const std::string& encoded,
     return false;
   }
 
-  // SSTable에 문자열로 저장된 Bloom filter bit array를 hex에서 decoding하는 함수
-
+  out->clear();
+  out->reserve(encoded.size() / 2);
+  for (size_t i = 0; i < encoded.size(); i += 2) {
+    uint8_t hi = 0;
+    uint8_t lo = 0;
+    if (!HexToNibble(encoded[i], &hi) || !HexToNibble(encoded[i + 1], &lo)) {
+      out->clear();
+      return false;
+    }
+    out->push_back(static_cast<uint8_t>((hi << 4) | lo));
+  }
   return true;
 }
 
@@ -83,8 +94,12 @@ BloomFilter BuildBloomFilterFromKeys(const std::vector<int>& keys,
     return filter;
   }
 
-  // key 목록으로부터 Bloom filter를 생성하는 함수
-
+  filter.bit_count = std::max<size_t>(8, keys.size() * bits_per_key);
+  filter.hash_count = hash_count;
+  filter.bits.assign(BloomByteSize(filter.bit_count), 0);
+  for (int key : keys) {
+    filter.Add(key);
+  }
   return filter;
 }
 
@@ -93,8 +108,9 @@ void BloomFilter::Add(int key) {
     return;
   }
 
-  // 하나의 key를 bloom filter에 등록하는 함수
-
+  for (size_t i = 0; i < hash_count; ++i) {
+    SetBit(&bits, PositiveModulo(SimpleHash(key, i), bit_count));
+  }
 }
 
 bool BloomFilter::MayContain(int key) const {
@@ -102,8 +118,11 @@ bool BloomFilter::MayContain(int key) const {
     return true;
   }
 
-  // 주어진 key에 대해 해당 bloom filter로 검사하는 함수
-
+  for (size_t i = 0; i < hash_count; ++i) {
+    if (!GetBit(bits, PositiveModulo(SimpleHash(key, i), bit_count))) {
+      return false;
+    }
+  }
   return true;
 }
 
